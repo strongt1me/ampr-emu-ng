@@ -28,6 +28,11 @@ pub(crate) unsafe fn complete_virtual_job(
     if return_value < 0 {
         stats::add(stats::Stat::PackJobErrors, 1);
     }
+    #[cfg(feature = "mem_report")]
+    {
+        let (file_id, offset, nbyte) = (job.file_id, job.request.offset, job.request.nbyte);
+        unsafe { read_notes::note_job(state, file_id, offset, nbyte, return_value) };
+    }
     job.return_value = return_value;
     job.completion_state = completion_state;
     let result = job.request.result;
@@ -925,4 +930,148 @@ pub(crate) fn reset_virtual_aio_slot(
     slot.submit_ns = 0;
     slot.prefetch_chunks = 0;
     slot.split_group = INVALID_INDEX;
+}
+
+/// Debug build: notes on finished read jobs, for a game that loops on reads
+/// (issue 37: the main thread spins in a terrain loader while the runtime is
+/// idle). Each note goes through `stats::fs_note`, so `/fsfail` keeps every
+/// distinct line once with its repeat count, and the black box keeps the order.
+/// Op `B`: lookup `e` a job that failed, `s` a read that returned fewer bytes
+/// than asked although it did not reach the end of the file (the runtime never
+/// does that on purpose), `r` the same (file, offset, length) read for the
+/// `REPEAT_AT`th time (direct-mapped table, racy on purpose: a debug trace).
+#[cfg(feature = "mem_report")]
+mod read_notes {
+    use super::*;
+    use core::sync::atomic::{AtomicU32, AtomicU64};
+
+    const SLOTS: usize = 64;
+    const REPEAT_AT: u32 = 200;
+    static KEYS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static COUNTS: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
+
+    /// Text in a fixed buffer, NUL-terminated for `fs_note`.
+    struct Text {
+        buf: [u8; 128],
+        n: usize,
+    }
+
+    impl Text {
+        fn new() -> Self {
+            Self { buf: [0; 128], n: 0 }
+        }
+
+        fn push(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                if self.n + 1 >= self.buf.len() {
+                    return;
+                }
+                self.buf[self.n] = b;
+                self.n += 1;
+            }
+        }
+
+        fn hex(&mut self, v: u64) {
+            self.push(b"0x");
+            let mut started = false;
+            for i in (0..16).rev() {
+                let d = ((v >> (i * 4)) & 0xf) as usize;
+                if d != 0 || started || i == 0 {
+                    started = true;
+                    self.push(&[b"0123456789abcdef"[d]]);
+                }
+            }
+        }
+    }
+
+    pub(super) unsafe fn note_job(
+        state: *const PackState,
+        file_id: u32,
+        offset: off_t,
+        nbyte: usize,
+        rc: i64,
+    ) {
+        if file_id == 0 {
+            return;
+        }
+        let want = nbyte as u64;
+        let (how, label) = if rc < 0 {
+            (b'e', &b"error "[..])
+        } else if (rc as u64) < want
+            && offset >= 0
+            && unsafe { packed_read_file(state, file_id) }
+                .is_some_and(|(_, size, _)| (offset as u64).saturating_add(rc as u64) < size)
+        {
+            (b's', &b"short "[..])
+        } else if repeated(file_id, offset, want) {
+            (b'r', &b"repeat "[..])
+        } else {
+            return;
+        };
+        let mut t = Text::new();
+        t.push(label);
+        let mut path = [0u8; 72];
+        match crate::rt::index::probe_file_path(file_id, &mut path) {
+            Some(n) => t.push(&path[..n.min(path.len() - 1)]),
+            None => {
+                t.push(b"fid=");
+                t.hex(u64::from(file_id));
+            }
+        }
+        t.push(b" off=");
+        t.hex(offset as u64);
+        t.push(b" want=");
+        t.hex(want);
+        t.push(b" got=");
+        if rc < 0 {
+            t.hex(rc as u32 as u64);
+        } else {
+            t.hex(rc as u64);
+        }
+        t.buf[t.n] = 0;
+        crate::rt::stats::fs_note(b'B', how, rc, t.buf.as_ptr().cast());
+    }
+
+    /// True once, when the same (file, offset, length) read finishes for the
+    /// `REPEAT_AT`th time in a row in its table slot.
+    fn repeated(file_id: u32, offset: off_t, want: u64) -> bool {
+        let key = ((u64::from(file_id) << 40) ^ (offset as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ want)
+            | 1;
+        let slot = (key >> 7) as usize % SLOTS;
+        if KEYS[slot].load(Ordering::Relaxed) != key {
+            KEYS[slot].store(key, Ordering::Relaxed);
+            COUNTS[slot].store(1, Ordering::Relaxed);
+            return false;
+        }
+        COUNTS[slot].fetch_add(1, Ordering::Relaxed) + 1 == REPEAT_AT
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The 200th identical read is reported once; another read in the same
+        /// slot starts a new count; a different read never reports.
+        #[test]
+        fn repeat_is_reported_once_at_the_limit() {
+            let hits = (1..=REPEAT_AT + 50)
+                .filter(|_| repeated(999_001, 0x1000, 0x8000))
+                .count();
+            assert_eq!(hits, 1);
+            assert!(!repeated(999_002, 0, 1));
+            assert!(!repeated(999_002, 0, 2));
+        }
+
+        #[test]
+        fn text_holds_hex_and_stops_at_its_size() {
+            let mut t = Text::new();
+            t.hex(0);
+            t.push(b" ");
+            t.hex(0xabc0_1234);
+            assert_eq!(&t.buf[..t.n], b"0x0 0xabc01234");
+            t.push(&[b'x'; 300]);
+            assert_eq!(t.n, 127);
+        }
+    }
 }

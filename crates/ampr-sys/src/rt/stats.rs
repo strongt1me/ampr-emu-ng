@@ -412,6 +412,10 @@ pub(crate) fn now() -> u64 {
 /// the debug `zstd_verify` knob also a zstd frame checksum mismatch),
 /// lookup b'-', path "decode fid=<hex> chunk=<hex> pack=<hex> off=<hex>
 /// size=<hex>".
+/// b'B' a finished read job on a packed file (rt/pack/worker.rs `read_notes`),
+/// lookup b'e' failed, b's' a short read before the end of the file, b'r' the
+/// same (file, offset, length) read for the 200th time; path "<kind> <file>
+/// off=<hex> want=<hex> got=<hex>".
 /// b'U' a getdents/getdirentries on a virtual directory fd (rt/pack/directories.rs
 /// `note_directory_read`), lookup b'd', path "read <directory> rc=<n>" with n
 /// the bytes of the batch or 0x<8 hex> for an SCE error; logged through
