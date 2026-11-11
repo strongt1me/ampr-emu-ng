@@ -740,7 +740,78 @@ unsafe fn emit_dot(
     0
 }
 
+/// `getdents` / `getdirentries` on a virtual directory fd. The debug build
+/// logs each distinct (directory, result) once (`note_directory_read`), so a
+/// trace shows whether a game that opened a packed directory read it, and what
+/// the read returned.
 pub(crate) unsafe fn ampr_pack_try_directory_read_fd(
+    fd: c_int,
+    buffer: *mut c_char,
+    size: c_int,
+    basep: *mut c_long,
+    use_getdirentries: bool,
+    handled: *mut bool,
+) -> c_int {
+    let rc = unsafe { directory_read_fd(fd, buffer, size, basep, use_getdirentries, handled) };
+    #[cfg(feature = "mem_report")]
+    if !handled.is_null() && unsafe { *handled } {
+        unsafe { note_directory_read(fd, rc) };
+    }
+    rc
+}
+
+/// The /fsfail line "read <directory> rc=<n>" (op `U`, lookup `d`): `n` is the
+/// byte count of the batch (0 at the end of the directory), or `0x<8 hex>`
+/// for an SCE error. Logged through `fs_note`, so every distinct result of a
+/// directory is kept once and `/fsfail` counts the repeats.
+#[cfg(feature = "mem_report")]
+unsafe fn note_directory_read(fd: c_int, rc: c_int) {
+    let mut path = [0u8; 96];
+    let Some(path_len) = (unsafe { virtual_directory_fd_path(fd, &mut path) }) else {
+        return;
+    };
+    let mut buf = [0u8; 128];
+    let mut n = 0usize;
+    let mut push = |bytes: &[u8]| {
+        for &b in bytes {
+            if n + 1 >= buf.len() {
+                return;
+            }
+            buf[n] = b;
+            n += 1;
+        }
+    };
+    push(b"read ");
+    push(&path[..path_len]);
+    push(b" rc=");
+    if rc >= 0 {
+        let mut digits = [0u8; 10];
+        let mut count = 0usize;
+        let mut v = rc as u32;
+        loop {
+            digits[count] = b'0' + (v % 10) as u8;
+            count += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        while count > 0 {
+            count -= 1;
+            push(&[digits[count]]);
+        }
+    } else {
+        push(b"0x");
+        let v = rc as u32;
+        for i in (0..8).rev() {
+            push(&[b"0123456789abcdef"[((v >> (i * 4)) & 0xf) as usize]]);
+        }
+    }
+    buf[n] = 0;
+    crate::rt::stats::fs_note(b'U', b'd', i64::from(rc), buf.as_ptr().cast());
+}
+
+unsafe fn directory_read_fd(
     fd: c_int,
     buffer: *mut c_char,
     size: c_int,
