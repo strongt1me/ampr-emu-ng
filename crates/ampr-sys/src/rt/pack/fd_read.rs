@@ -483,6 +483,19 @@ fn spin_for_call(us: u32) {
 
 unsafe extern "C" fn read_thread(arg: *mut c_void) -> *mut c_void {
     let slot = arg as usize;
+    // Same priority and cores as the pack workers (worker.rs
+    // `pack_worker_entry`). Created with default attributes, a read thread
+    // ran at whatever priority libkernel gave it, the only unpinned link
+    // between a game thread blocked in read() and the worker that serves it.
+    // In issue 37 (Kingdom Come 2) the game spun in its loader while the
+    // runtime was idle, and reading inline on the game thread instead of
+    // through these threads let it load.
+    unsafe {
+        let _ = scePthreadSetprio(scePthreadSelf(), AMPR_EMU_PACK_WORKER_PRIORITY);
+        if AMPR_EMU_PACK_WORKER_AFFINITY != 0 {
+            let _ = scePthreadSetaffinity(scePthreadSelf(), AMPR_EMU_PACK_WORKER_AFFINITY);
+        }
+    }
     // Under READ_M: this thread leaves the live set.
     let leave = || {
         READ_THREADS_UP.fetch_sub(1, Ordering::Release);
