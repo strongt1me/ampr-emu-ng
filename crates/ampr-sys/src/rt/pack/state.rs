@@ -131,24 +131,45 @@ pub(crate) fn decode_virtual_fd(fd: c_int) -> Option<u32> {
     packed_fd_slot(fd as u32)
 }
 
-pub(crate) fn encode_virtual_directory_fd(slot: u32, generation: u16) -> c_int {
-    ampr_rust_virtual_encode(VIRTUAL_KIND_DIRECTORY_FD, slot, generation) as c_int
+/// The fd of virtual directory `slot`: the plain number `BASE + slot` in
+/// `288..512` (see `AMPR_EMU_PACK_VIRTUAL_DIRECTORY_FD_BASE`). The slot's
+/// generation is not part of the number; `decode_virtual_directory_fd` reads
+/// it from VIRTUAL_DIRECTORY_LIVE, so a slot reused between the decode and
+/// the slot lock still fails the generation check.
+pub(crate) fn encode_virtual_directory_fd(slot: u32, _generation: u16) -> c_int {
+    (AMPR_EMU_PACK_VIRTUAL_DIRECTORY_FD_BASE as u32 + slot) as c_int
 }
 
+/// Open slot and generation named by a virtual directory fd, or false for a
+/// number outside the range or whose slot is closed. `slot` and `generation`
+/// may be null.
 pub(crate) unsafe fn decode_virtual_directory_fd(
     fd: c_int,
     slot: *mut u32,
     generation: *mut u16,
 ) -> bool {
-    unsafe {
-        ampr_rust_virtual_decode(
-            VIRTUAL_KIND_DIRECTORY_FD,
-            fd as u32,
-            AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS as u32,
-            slot,
-            generation,
-        )
+    let Some(index) = directory_fd_slot(fd) else {
+        return false;
+    };
+    let live = VIRTUAL_DIRECTORY_LIVE[index as usize].load(Ordering::Acquire);
+    if live == 0 {
+        return false;
     }
+    unsafe {
+        if !slot.is_null() {
+            *slot = index;
+        }
+        if !generation.is_null() {
+            *generation = live;
+        }
+    }
+    true
+}
+
+/// Slot index of a number in the virtual directory range, open or not.
+fn directory_fd_slot(fd: c_int) -> Option<u32> {
+    let index = (fd as u32).checked_sub(AMPR_EMU_PACK_VIRTUAL_DIRECTORY_FD_BASE as u32)?;
+    (fd >= 0 && (index as usize) < AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS).then_some(index)
 }
 
 pub(crate) fn encode_virtual_aio(slot: u32, generation: u16) -> SceKernelAioSubmitId {
@@ -697,6 +718,39 @@ mod tests {
         assert!(!pread_loop(1, 0, 4, |_, _, _| -1, || EINTR + 1), "EIO");
         assert!(!pread_loop(1, off_t::MAX as u64, 4, |_, _, _| 1, || 0));
         assert!(!pread_loop(2, 0, 4, |_, _, _| 3, || 0), "rc above request");
+    }
+
+    #[test]
+    fn directory_fd_range_is_below_the_packed_fds_and_needs_an_open_slot() {
+        let base = AMPR_EMU_PACK_VIRTUAL_DIRECTORY_FD_BASE as u32;
+        let last = AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS - 1;
+        // Every directory fd is a small number: above the kernel's table,
+        // below the packed-file range and far below 1024 (issue 45).
+        let first_fd = encode_virtual_directory_fd(0, 7);
+        let last_fd = encode_virtual_directory_fd(last as u32, 7);
+        assert_eq!(first_fd as u32, base);
+        assert!(first_fd > 259);
+        assert!((last_fd as usize) < AMPR_EMU_PACK_VIRTUAL_FD_BASE);
+        // A closed slot's number is not claimed: it goes to the kernel.
+        let (mut slot, mut generation) = (0u32, 0u16);
+        assert!(!unsafe { decode_virtual_directory_fd(first_fd, &mut slot, &mut generation) });
+        VIRTUAL_DIRECTORY_LIVE[0].store(5, Ordering::Release);
+        VIRTUAL_DIRECTORY_LIVE[last].store(9, Ordering::Release);
+        assert!(unsafe { decode_virtual_directory_fd(first_fd, &mut slot, &mut generation) });
+        assert_eq!((slot, generation), (0, 5));
+        assert!(unsafe { decode_virtual_directory_fd(last_fd, &mut slot, &mut generation) });
+        assert_eq!((slot, generation), (last as u32, 9));
+        assert!(unsafe { decode_virtual_directory_fd(first_fd, null_mut(), null_mut()) });
+        // Neighbours, low fds, packed fds and the old tagged handles are not
+        // directory fds.
+        for fd in [first_fd - 1, last_fd + 1, 3, AMPR_EMU_PACK_VIRTUAL_FD_BASE as c_int, -1] {
+            assert!(!unsafe { decode_virtual_directory_fd(fd, &mut slot, &mut generation) });
+        }
+        let old_tagged = 0x6700_0100u32 as c_int;
+        assert!(!unsafe { decode_virtual_directory_fd(old_tagged, null_mut(), null_mut()) });
+        VIRTUAL_DIRECTORY_LIVE[0].store(0, Ordering::Release);
+        VIRTUAL_DIRECTORY_LIVE[last].store(0, Ordering::Release);
+        assert!(!unsafe { decode_virtual_directory_fd(first_fd, null_mut(), null_mut()) });
     }
 
     #[test]

@@ -586,7 +586,24 @@ pub(crate) const AMPR_EMU_PACK_RUNTIME_PROFILE_PATH: &CStr = c"/app0/ampr_assets
 pub(crate) const AMPR_EMU_PACK_ROOT_PATH: &CStr = c"/app0";
 pub(crate) const AMPR_EMU_PACK_LOGICAL_ROOT_PATH: &CStr = c"/app0";
 
-pub(crate) const AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS: usize = 256;
+/// Virtual directories open at once. A directory fd is the plain number
+/// `AMPR_EMU_PACK_VIRTUAL_DIRECTORY_FD_BASE + slot`, so slots and base share
+/// the room between the kernel's table (259) and the packed-file range (512).
+pub(crate) const AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS: usize = 224;
+/// First virtual directory fd: `288..512`, below the packed-file range and
+/// 29 above the kernel's effective table (259, see
+/// `AMPR_EMU_PACK_VIRTUAL_FD_BASE`), so no real descriptor lands there. The
+/// tagged handles used before (`0x67GGGGSS`, about 1.7e9) were above every
+/// title's limit: a title that rejects fd >= 1024 (see below) got such a
+/// number for an open `O_DIRECTORY` of a packed directory. Call of Duty Black
+/// Ops Cold War on an internal SSD install stopped right after receiving
+/// 0x67000100 for /app0/zone and made no further file call (issue 45).
+pub(crate) const AMPR_EMU_PACK_VIRTUAL_DIRECTORY_FD_BASE: usize = 288;
+const _: () = assert!(
+    AMPR_EMU_PACK_VIRTUAL_DIRECTORY_FD_BASE > 259
+        && AMPR_EMU_PACK_VIRTUAL_DIRECTORY_FD_BASE + AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS
+            <= AMPR_EMU_PACK_VIRTUAL_FD_BASE
+);
 /// Decode workers, from the Makefile's `AMPR_PACK_WORKERS` (default 4, also
 /// outside the Makefile): each has a 1 MiB decode buffer from prepare to
 /// shutdown; threads start at 1 and grow on demand (worker.rs). Decode took
@@ -742,7 +759,6 @@ pub(crate) const PACK_PHYSICAL_CACHE_BITMAP_WORDS: usize =
 pub(crate) const INVALID_INDEX: u32 = u32::MAX;
 // ampr_format::handles::Kind; the tags live in Rust.
 pub(crate) const VIRTUAL_KIND_AIO: u32 = 1;
-pub(crate) const VIRTUAL_KIND_DIRECTORY_FD: u32 = 2;
 pub(crate) const VIRTUAL_KIND_AIO_GROUP: u32 = 3;
 pub(crate) const PACK_LOAD_UNINITIALIZED: u32 = 0;
 pub(crate) const PACK_LOAD_LOADING: u32 = 1;
@@ -1525,6 +1541,14 @@ pub(crate) static MANIFEST_MUTEX: Mutex = Mutex::new();
 pub(crate) static DIRECTORY_TABLE_MUTEX: Mutex = Mutex::new();
 pub(crate) static DIRECTORY_MUTEXES: [Mutex; AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS] =
     [const { Mutex::new() }; AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS];
+/// The open generation of each virtual directory slot, 0 while closed
+/// (generations skip 0). Written under the slot's DIRECTORY_MUTEXES entry;
+/// read lock-free by `decode_virtual_directory_fd`, so a number in the
+/// directory range with no open slot goes to the kernel without taking a
+/// lock or the pack state, as with VIRTUAL_FD_LIVE.
+pub(crate) static VIRTUAL_DIRECTORY_LIVE: [core::sync::atomic::AtomicU16;
+    AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS] =
+    [const { core::sync::atomic::AtomicU16::new(0) }; AMPR_EMU_PACK_VIRTUAL_DIRECTORY_SLOTS];
 pub(crate) static QUEUE_CV: Condvar = Condvar::new();
 pub(crate) static AIO_CV: Condvar = Condvar::new();
 pub(crate) static SUBMIT_CV: Condvar = Condvar::new();

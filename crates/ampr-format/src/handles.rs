@@ -1,7 +1,10 @@
-//! Virtual handle encoding: directory fds, AIO submit ids and AIO group ids
-//! share one 32-bit layout, `tag(8) | generation(16) | slot(8)`. Packed-file
-//! fds are plain synthetic numbers in `512..1024` (ampr-sys `rt/pack/mod.rs`
-//! `AMPR_EMU_PACK_VIRTUAL_FD_BASE`), not tagged handles.
+//! Virtual handle encoding: AIO submit ids and AIO group ids share one 32-bit
+//! layout, `tag(8) | generation(16) | slot(8)`. Packed-file fds and virtual
+//! directory fds are plain synthetic numbers below 1024 (`512..1024` and
+//! `288..512`, ampr-sys `rt/pack/mod.rs` `AMPR_EMU_PACK_VIRTUAL_FD_BASE` and
+//! `AMPR_EMU_PACK_VIRTUAL_DIRECTORY_FD_BASE`), not tagged handles: a title
+//! that rejects fd >= 1024 stopped on a tagged directory fd. `Kind::DirectoryFd`
+//! stays for the C ABI value only.
 
 /// Handle kinds; the discriminant is the C ABI value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

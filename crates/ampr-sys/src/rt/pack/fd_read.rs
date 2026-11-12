@@ -1539,6 +1539,7 @@ unsafe fn close_pack_and_directory_fds(state: *mut PackState) {
                     directory_fds[directory_fd_count] = (*directory).real_fd;
                     directory_fd_count += 1;
                 }
+                VIRTUAL_DIRECTORY_LIVE[i].store(0, Ordering::Release);
                 let generation = (*directory).generation;
                 directory.write(VirtualDirectorySlot::EMPTY);
                 (*directory).generation = generation;

@@ -516,7 +516,7 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
         if !handled.is_null() {
             *handled = false;
         }
-        // A tagged directory fd or an open synthetic packed fd is decided before
+        // An open virtual directory fd or packed fd is decided before
         // pack_state(): a physical fd (the runtime's own closes reach here
         // through libkernel's `close` -> `_close` hook) must never create or
         // wait on the pack state. tune::load inside pack_state_create once
@@ -542,6 +542,9 @@ pub unsafe fn ampr_pack_try_close_fd(fd: c_int, handled: *mut bool) -> c_int {
                     return SCE_KERNEL_ERROR_EBADF;
                 }
                 real_fd = slot.real_fd;
+                // Unpublished first, under the slot mutex: the number goes
+                // back to the kernel from here on.
+                VIRTUAL_DIRECTORY_LIVE[index as usize].store(0, Ordering::Release);
                 let preserved_generation = slot.generation;
                 // `slot = {}` in place (the slot is ~5 KiB; EMPTY is zero but realFd).
                 (slot as *mut VirtualDirectorySlot).write_bytes(0, 1);

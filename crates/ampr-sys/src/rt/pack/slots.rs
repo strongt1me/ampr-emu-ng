@@ -313,6 +313,8 @@ pub(crate) unsafe fn allocate_virtual_directory_locked(
                 core::ptr::copy_nonoverlapping(path, slot.path.as_mut_ptr(), path_length as usize)
             };
             slot.path[path_length as usize] = 0;
+            // Published last, under the slot mutex: the fd decodes from here on.
+            VIRTUAL_DIRECTORY_LIVE[index as usize].store(generation, Ordering::Release);
             (*state).virtual_directory_cursor = (index + 1) % slots;
             return index;
         }
