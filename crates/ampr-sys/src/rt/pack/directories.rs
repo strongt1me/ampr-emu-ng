@@ -770,6 +770,27 @@ unsafe fn note_directory_read(fd: c_int, rc: c_int) {
     let Some(path_len) = (unsafe { virtual_directory_fd_path(fd, &mut path) }) else {
         return;
     };
+    note_directory_line(&path[..path_len], b"read ", b" rc=", rc, b'd');
+}
+
+/// The /fsfail line "realfail <directory> errno=<n>" (op `U`, lookup `x`):
+/// the physical `getdents` behind a virtual directory failed with `errno`, so
+/// the listing continues from the index alone (`directory_read_fd`). Called
+/// with the slot's path under its mutex, which `note_directory_read` cannot take.
+#[cfg(feature = "mem_report")]
+fn note_directory_real_failure(path: &[c_char], errno: c_int) {
+    let mut bytes = [0u8; 96];
+    let n = path.len().min(bytes.len() - 1);
+    for (i, b) in bytes[..n].iter_mut().enumerate() {
+        *b = path[i] as u8;
+    }
+    note_directory_line(&bytes[..n], b"realfail ", b" errno=", errno, b'x');
+}
+
+/// `<label><path><mid><value>` as an `fs_note` line of op `U`: `value` in
+/// decimal when it is not negative, else as `0x<8 hex>`.
+#[cfg(feature = "mem_report")]
+fn note_directory_line(path: &[u8], label: &[u8], mid: &[u8], value: c_int, how: u8) {
     let mut buf = [0u8; 128];
     let mut n = 0usize;
     let mut push = |bytes: &[u8]| {
@@ -781,13 +802,13 @@ unsafe fn note_directory_read(fd: c_int, rc: c_int) {
             n += 1;
         }
     };
-    push(b"read ");
-    push(&path[..path_len]);
-    push(b" rc=");
-    if rc >= 0 {
+    push(label);
+    push(path);
+    push(mid);
+    if value >= 0 {
         let mut digits = [0u8; 10];
         let mut count = 0usize;
-        let mut v = rc as u32;
+        let mut v = value as u32;
         loop {
             digits[count] = b'0' + (v % 10) as u8;
             count += 1;
@@ -802,13 +823,23 @@ unsafe fn note_directory_read(fd: c_int, rc: c_int) {
         }
     } else {
         push(b"0x");
-        let v = rc as u32;
+        let v = value as u32;
         for i in (0..8).rev() {
             push(&[b"0123456789abcdef"[((v >> (i * 4)) & 0xf) as usize]]);
         }
     }
     buf[n] = 0;
-    crate::rt::stats::fs_note(b'U', b'd', i64::from(rc), buf.as_ptr().cast());
+    crate::rt::stats::fs_note(b'U', how, i64::from(value), buf.as_ptr().cast());
+}
+
+/// Whether a failed physical `getdents` ends the physical part of the
+/// listing. EINTR and EAGAIN are the caller's to retry and go back to it;
+/// anything else (issue 45: -1 on every call for `/app0/zone` of an internal
+/// SSD install, 67 million times in 92 s while the same listing on USB exFAT
+/// worked) would give the game the same error again, so the physical entries
+/// are dropped and the packed ones are listed instead.
+fn physical_getdents_failure_is_final(errno: c_int) -> bool {
+    errno != EINTR && errno != EAGAIN
 }
 
 unsafe fn directory_read_fd(
@@ -866,7 +897,15 @@ unsafe fn directory_read_fd(
                 f(slot.real_fd, buffer, size)
             };
             if rc < 0 {
-                return rc;
+                let errno = open_failure_errno(rc);
+                if !physical_getdents_failure_is_final(errno) {
+                    return rc;
+                }
+                #[cfg(feature = "mem_report")]
+                note_directory_real_failure(&slot.path[..slot.path_length as usize], errno);
+                slot.real_failed = true;
+                slot.real_exhausted = true;
+                break;
             }
             if use_getdirentries {
                 slot.directory_offset = overlay::advance_offset(physical_base, rc);
@@ -920,7 +959,9 @@ unsafe fn directory_read_fd(
 
         let mut output = 0usize;
         let synthetic_base = slot.directory_offset;
-        if slot.real_fd < 0 {
+        // A physical directory lists `.` and `..` itself; with none, or one
+        // that failed to list, they come from here.
+        if slot.real_fd < 0 || slot.real_failed {
             for (name, which) in [(c".", 0), (c"..", 1)] {
                 let emitted = if which == 0 {
                     &mut slot.dot_emitted
@@ -1028,5 +1069,20 @@ mod tests {
         assert_eq!(physical_dirent_bounds(&record(16, 8, 16)), None);
         assert_eq!(physical_dirent_bounds(&record(24, 3, 16)), None);
         assert_eq!(physical_dirent_bounds(&record(8, 0, 16)), None);
+    }
+
+    /// A physical `getdents` that fails for good (issue 45) ends the physical
+    /// listing; an interrupted or would-block one goes back to the caller.
+    #[test]
+    fn physical_getdents_failure_ends_the_listing_except_for_retries() {
+        assert!(!physical_getdents_failure_is_final(EINTR));
+        assert!(!physical_getdents_failure_is_final(EAGAIN));
+        for errno in [EINVAL, EIO, ENOENT, EBADF, EFAULT] {
+            assert!(physical_getdents_failure_is_final(errno), "{errno}");
+        }
+        // `open_failure_errno` maps the raw -1 to errno() and an SCE code to
+        // its POSIX value, so a failed listing is told apart from a retry.
+        assert_eq!(open_failure_errno(SCE_KERNEL_ERROR_EINVAL), EINVAL);
+        assert_eq!(open_failure_errno(SCE_KERNEL_ERROR_EIO), EIO);
     }
 }
